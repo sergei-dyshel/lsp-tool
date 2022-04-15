@@ -15,200 +15,110 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
+	"log"
 	"os"
 	"os/exec"
-	"strings"
+	"path"
+
+	"github.com/spf13/cobra"
 )
 
-func panicIfError(e error) {
-	if e != nil {
-		panic(e)
-	}
-}
+var progName = path.Base(os.Args[0])
 
-func printHelp() {
-	fmt.Printf(`%[1]v <bin> <mode> <providers...> -- <args...>
+var help = fmt.Sprintf(`LSP server wrapper
 
-bin: the binary of the language server
+Filtering (--enable/--disable) allows to run multiple servers so that
+with only one of them providing specific capabilities.
 
-mode: enable or disable
-    enable: allow only the specified providers
-    disable: allow all providers except the specified ones
-
-providers: language server capability without the "Provider" at the end
-    codeAction codeLens completion definition documentFormatting
-    documentHighlight documentRangeFormatting documentLink documentSymbol
-    hover implementation references rename signatureHelp typeDefinition
-    workspaceSymbol
-
-args: arguments to pass to the language server binary <bin>
+PROVIDERS are language server capabilities without the "Provider" at the end
+	(see https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#serverCapabilities for complete list)
 
 Examples:
-  %[1]v cquery disable completion codeAction --
-  %[1]v clangd enable completion codeAction --
-`, os.Args[0])
-	os.Exit(1)
-}
+  %[1]v --enable completion,codeAction clangd
+  %[1]v --disable completion,codeAction ccls
+`, progName)
 
-func indexOf(element string, data []string) int {
-	for i, v := range data {
-		if element == v {
-			return i
-		}
-	}
-	return -1
-}
-
-func contains(element string, data []string) bool {
-	return indexOf(element, data) >= 0
-}
-
-type mode int
-
-const (
-	modeEnable mode = iota
-	modeDisable
+var (
+	enableProviders  *[]string
+	disableProviders *[]string
+	logFileName      *string
+	logLevel         *int
 )
 
-func parseMode(value string) mode {
-	if value == "enable" {
-		return modeEnable
+func validateArgs(_ *cobra.Command, args []string) error {
+	if len(*enableProviders) > 0 && len(*disableProviders) > 0 {
+		return errors.New("both enable/disable flags given")
 	}
-	if value == "disable" {
-		return modeDisable
+	if len(args) == 0 {
+		return errors.New("empty command")
 	}
-	fmt.Fprintf(os.Stderr, "Mode must be either enable or disable, not %v\n", value)
-	os.Exit(1)
-	return modeDisable
+	return nil
 }
 
-func main() {
-	if len(os.Args) < 4 {
-		printHelp()
+func run(_ *cobra.Command, args []string) error {
+	if *logFileName == "" {
+		log.SetOutput(os.Stderr)
+		log.SetPrefix("lsp-tool: ")
+	} else {
+		file, err := os.OpenFile(*logFileName, os.O_WRONLY|os.O_TRUNC|os.O_CREATE, 0666)
+		if err != nil {
+			return fmt.Errorf("can not open log file: %w", err)
+		}
+		log.SetOutput(file)
 	}
-	ourArgEnd := indexOf("--", os.Args)
-	if ourArgEnd < 0 {
-		printHelp()
-	}
+	log.SetFlags(0)
 
-	binary := os.Args[1]
-	mode := parseMode(os.Args[2])
-
-	providers := os.Args[3:ourArgEnd]
-	appOpts := os.Args[ourArgEnd+1:]
-	fmt.Fprintf(os.Stderr, "Running binary %v %v in mode %v %v\n", binary, appOpts, os.Args[2], providers)
-
-	cmd := exec.Command(binary, appOpts...)
+	log.Printf("Running %s", args)
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stderr = os.Stderr
-	lsStdout, e := cmd.StdoutPipe()
-	panicIfError(e)
-	e = cmd.Start()
-	panicIfError(e)
+	lsStdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("could not create stdout pipe: %w", err)
+	}
+	err = cmd.Start()
+	panicIfError(err) // should not happen
+
+	var mode filterMode = noFilter
+	var providers []string
+	if len(*enableProviders) > 0 {
+		mode = enableFilter
+		providers = *enableProviders
+	} else if len(*disableProviders) > 0 {
+		mode = disableFilter
+		providers = *disableProviders
+	}
 
 	go stdoutReader(lsStdout, mode, providers)
 
-	cmd.Wait()
-	panicIfError(e)
+	err = cmd.Wait()
+	if err != nil {
+		return fmt.Errorf("command failed: %w", err)
+	}
+	return nil
 }
 
-func stdoutWrite(b []byte) {
-	osStdout := bufio.NewWriter(os.Stdout)
-	_, e := fmt.Fprintf(osStdout, "Content-Length: %d\r\n\r\n", len(b))
-	panicIfError(e)
-	_, e = osStdout.Write(b)
-	osStdout.Flush()
+var (
+	rootCmd = &cobra.Command{
+		Use:  fmt.Sprintf("%s [-l] [-v] [ -e ... | -d ... ] -- <exe> <args>...", progName),
+		Long: help,
+		RunE: run,
+		Args: validateArgs,
 
-	osStderr := bufio.NewWriter(os.Stderr)
-	fmt.Fprintf(osStderr, "%v wrote the following to stderr:\n\t", os.Args[0])
-	osStderr.Write(b)
-	osStderr.Flush()
-
-	panicIfError(e)
-}
-
-func stdoutReader(lsStdout io.ReadCloser, mode mode, providers []string) {
-	// Build scanner which will process LSP messages.
-	scanner := bufio.NewScanner(lsStdout)
-	scanner.Split(jsonRpcSplitFunc)
-	osStdout := bufio.NewWriter(os.Stdout)
-	for scanner.Scan() {
-		fmt.Fprintln(os.Stderr, scanner.Text())
-		var f interface{}
-		err := json.Unmarshal(scanner.Bytes(), &f)
-		panicIfError(err)
-		jsonRoot, had := f.(map[string]interface{})
-		if !had {
-			stdoutWrite(scanner.Bytes())
-			continue
-		}
-		jsonResult, had := jsonRoot["result"].(map[string]interface{})
-		if !had {
-			stdoutWrite(scanner.Bytes())
-			continue
-		}
-		jsonCapabilities, had := jsonResult["capabilities"].(map[string]interface{})
-		if !had {
-			stdoutWrite(scanner.Bytes())
-			continue
-		}
-
-		if mode == modeEnable {
-			// Only enable providers in the whitelist
-			for k := range jsonCapabilities {
-				if !strings.HasSuffix(k, "Provider") {
-					continue
-				}
-				rawName := strings.TrimSuffix(k, "Provider")
-				if !contains(rawName, providers) {
-					jsonCapabilities[k] = false
-				}
-			}
-		} else if mode == modeDisable {
-			// Only disable the specified providers
-			for k := range jsonCapabilities {
-				if !strings.HasSuffix(k, "Provider") {
-					continue
-				}
-				rawName := strings.TrimSuffix(k, "Provider")
-				if contains(rawName, providers) {
-					jsonCapabilities[k] = false
-				}
-			}
-		}
-
-		// Serialize and write message
-		b, e := json.Marshal(f)
-		panicIfError(e)
-		stdoutWrite(b)
-
-		break
+		DisableFlagsInUseLine: true,
 	}
-	panicIfError(scanner.Err())
+)
 
-	// Write the rest of the content blindly
-	var buffer [1024]byte
-	for {
-		n, e := lsStdout.Read(buffer[:])
-		if e != nil {
-			break
-		}
+func main() {
+	enableProviders = rootCmd.Flags().StringSliceP("enable", "e", nil, "allow only the providers from `PROVIDERS` (comma-separated)")
+	disableProviders = rootCmd.Flags().StringSliceP("disable", "d", nil, "allow all providers except from `PROVIDERS` (comma-separated)")
+	logFileName = rootCmd.Flags().StringP("log", "l", "", "write log to `FILENAME` (default: stderr)")
+	logLevel = rootCmd.Flags().CountP("verbose", "v", "Verbosity level, repeat to increase verbosity")
 
-		w := bufio.NewWriter(os.Stderr)
-		w.Write(buffer[:n])
-		w.Flush()
-
-		_, e = osStdout.Write(buffer[:n])
-		osStdout.Flush()
-		if e != nil {
-			break
-		}
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
 	}
-
-	// Close stdout.
-	panicIfError(lsStdout.Close())
 }

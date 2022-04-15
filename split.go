@@ -27,7 +27,7 @@ func jsonRpcSplitFunc(data []byte, atEOF bool) (advance int, token []byte, err e
 
 	maybeAddEOFError := func() {
 		if atEOF {
-			err = errors.New("Expected more content")
+			err = errors.New("expected more content")
 		}
 	}
 
@@ -40,7 +40,7 @@ func jsonRpcSplitFunc(data []byte, atEOF bool) (advance int, token []byte, err e
 			}
 
 			if data[i] != byte(c) {
-				err = fmt.Errorf("Unexpected token '%c'", data[i])
+				err = fmt.Errorf("unexpected token '%c'", data[i])
 				return
 			}
 			i++
